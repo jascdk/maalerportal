@@ -76,9 +76,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 for entity in platform.entities.values()
                 if installation_id is None or entity.installation_id == installation_id
             ]
+            # One fetch per installation, then the history each sensor keeps.
+            coordinators = {id(sensor.coordinator): sensor.coordinator for sensor in sensors}
+            for coordinator in coordinators.values():
+                await coordinator.async_refresh()
             for sensor in sensors:
-                await sensor.async_refresh()
-            _LOGGER.debug("Refreshed %d entities", len(sensors))
+                await sensor.async_force_refresh()
+            _LOGGER.debug(
+                "Refreshed %d installations, %d entities", len(coordinators), len(sensors)
+            )
 
         hass.services.async_register(
             DOMAIN,

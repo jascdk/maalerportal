@@ -1,60 +1,78 @@
 """Platform for Målerportal sensor integration."""
 
-import asyncio
-from datetime import datetime, timedelta, timezone
-import logging
-import re
-from typing import Any, Optional
-import aiohttp
+from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import logging
+from typing import Any, Optional
+
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import (
+    async_import_statistics,
+    get_last_statistics,
+    statistics_during_period,
+)
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.models import (
-    StatisticData,
-    StatisticMetaData,
-    StatisticMeanType,
-)
-from homeassistant.components.recorder.statistics import (
-    async_import_statistics,
-    get_last_statistics,
-)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     EntityCategory,
     UnitOfEnergy,
-    UnitOfVolume,
+    UnitOfPower,
     UnitOfTemperature,
     UnitOfTime,
-    UnitOfPower,
+    UnitOfVolume,
 )
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.restore_state import RestoreEntity
-
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
-    API_TIMEOUT_SECONDS,
     DEFAULT_POLLING_INTERVAL,
     DOMAIN,
     STALE_ENTITIES_STORAGE_VERSION,
     consumer_app_url,
     stale_entities_storage_key,
 )
+from .coordinator import MAX_HISTORY_DAYS, MaalerportalCoordinator
+from .parsing import parse_api_timestamp, parse_number
+from .statistics import (
+    consumption_by_hour,
+    consumption_rows,
+    counter_offset,
+    counter_readings_by_hour,
+    counter_rows,
+    total_before,
+)
 from .units import LITERS_PER_HOUR, resolve_unit, statistics_unit_class
 
-# Import event firing function - will be available after __init__ loads
 EVENT_METER_UPDATED = f"{DOMAIN}_meter_updated"
 
 _LOGGER = logging.getLogger(__name__)
+
+# History (statistics and virtual meters) arrives per hour, so it is never
+# fetched more often than this.
+MIN_HISTORY_INTERVAL = timedelta(hours=1)
+
+# Window re-read on every history round once statistics exist. Hours the
+# utility delivers late inside this window are still imported.
+RECENT_HISTORY_DAYS = 7
+
 
 def get_polling_interval(config: ConfigEntry) -> timedelta:
     """Get polling interval from config options."""
@@ -72,52 +90,62 @@ async def async_setup_entry(
     api_key: str = config_data["api_key"]
     smarthome_base_url: str = config_data["smarthome_base_url"]
     polling_interval = get_polling_interval(config)
-    
-    sensors = []
+
+    sensors: list[SensorEntity] = []
+    coordinators: list[MaalerportalCoordinator] = []
     # Installations whose counter list we actually got; only those are safe to prune.
     fetched_installation_ids: set[str] = set()
 
     for installation in installations:
-        try:
-            # Fetch meter counters to determine what sensors to create
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
-                try:
-                    response = await session.get(
-                        f"{smarthome_base_url}/installations/{installation['installationId']}/readings/latest",
-                        headers={"ApiKey": api_key},
-                    )
-                    
-                    if response.ok:
-                        readings_data = await response.json()
-                        meter_counters = readings_data.get("meterCounters", [])
-                        
-                        # Create sensors based on available meter counters
-                        installation_sensors = create_sensors_from_counters(
-                            installation, api_key, smarthome_base_url, meter_counters, polling_interval
-                        )
-                        sensors.extend(installation_sensors)
-                        # Only a non-empty counter list proves the API knows this
-                        # installation. Pruning must never act on an empty answer.
-                        if meter_counters:
-                            fetched_installation_ids.add(installation["installationId"])
-                    else:
-                        _LOGGER.warning("Failed to fetch meter data for installation %s (HTTP %s), creating basic sensor", 
-                                      installation["installationId"], response.status)
-                        # Fallback to basic sensor
-                        sensors.append(MaalerportalBasicSensor(installation, api_key, smarthome_base_url, polling_interval))
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("Timeout fetching meter data for installation %s, creating basic sensor", 
-                                  installation["installationId"])
-                    sensors.append(MaalerportalBasicSensor(installation, api_key, smarthome_base_url, polling_interval))
-                    
-        except Exception as err:
-            _LOGGER.error("Error setting up sensors for installation %s: %s", 
-                         installation["installationId"], err)
-            # Fallback to basic sensor
-            sensors.append(MaalerportalBasicSensor(installation, api_key, smarthome_base_url, polling_interval))
+        coordinator = MaalerportalCoordinator(
+            hass, config, installation, api_key, smarthome_base_url, polling_interval
+        )
+        coordinators.append(coordinator)
+        # One fetch per installation decides which sensors to create, and the
+        # same answer gives them their values right away.
+        await coordinator.async_refresh()
 
+        if coordinator.last_update_success and coordinator.data is not None:
+            meter_counters = coordinator.data.get("meterCounters", [])
+            sensors.extend(create_sensors_from_counters(coordinator, meter_counters))
+            # Only a non-empty counter list proves the API knows this
+            # installation. Pruning must never act on an empty answer.
+            if meter_counters:
+                fetched_installation_ids.add(coordinator.installation_id)
+        else:
+            _LOGGER.warning(
+                "Could not fetch meter data for installation %s, creating basic sensor",
+                coordinator.installation_id,
+            )
+            sensors.append(MaalerportalBasicSensor(coordinator))
+            _reload_when_counters_arrive(hass, config, coordinator)
+
+    config_data["coordinators"] = coordinators
     await _async_remove_stale_entities(hass, config, sensors, fetched_installation_ids)
     async_add_entities(sensors)
+
+
+def _reload_when_counters_arrive(
+    hass: HomeAssistant, config: ConfigEntry, coordinator: MaalerportalCoordinator
+) -> None:
+    """Reload the entry once a fallback installation answers, to get its real sensors."""
+
+    reloading = False
+
+    @callback
+    def _check() -> None:
+        nonlocal reloading
+        if reloading or not (coordinator.data and coordinator.data.get("meterCounters")):
+            return
+        reloading = True
+        _LOGGER.info(
+            "Meter data for installation %s is available again; reloading to create its sensors",
+            coordinator.installation_id,
+        )
+        hass.config_entries.async_schedule_reload(config.entry_id)
+
+    # Removed when the entry unloads, which the reload does.
+    config.async_on_unload(coordinator.async_add_listener(_check))
 
 
 async def _async_remove_stale_entities(
@@ -164,147 +192,101 @@ async def _async_remove_stale_entities(
 
 
 def create_sensors_from_counters(
-    installation: dict, api_key: str, smarthome_base_url: str, meter_counters: list[dict], polling_interval: timedelta
+    coordinator: MaalerportalCoordinator, meter_counters: list[dict]
 ) -> list[SensorEntity]:
     """Create appropriate sensors based on available meter counters."""
-    sensors = []
-    
+    sensors: list[SensorEntity] = []
+
     # Consumable counter types:
-    # - For readingType="counter": Only meter reading sensor (direct from meter)
+    # - For readingType="counter": meter reading sensor + statistics sensor
     # - For readingType="consumption": Statistics sensor (Energy Dashboard) + Consumption sensor
     consumable_counter_types = [
         "ColdWater", "HotWater", "ElectricityFromGrid", "ElectricityToGrid", "Heat"
     ]
-    
+
     # Heat meter counter types
     supply_temp_types = ["SupplyTemp", "FlowTemp", "T1", "SupplyTemperature"]
     return_temp_types = ["ReturnTemp", "T2", "ReturnTemperature"]
     temp_diff_types = ["TempDiff", "DeltaT", "TemperatureDifference"]
     heat_power_types = ["Power", "Effect", "HeatPower"]
     heat_volume_types = ["Volume", "V1", "HeatVolume"]
-    
+
     # Find primary counter for main sensor
     primary_counter = None
     for counter in meter_counters:
         if counter.get("isPrimary", False):
             primary_counter = counter
             break
-    
+
     if not primary_counter and meter_counters:
         primary_counter = meter_counters[0]
-    
+
     # Create sensors for primary counter based on reading type
     if primary_counter:
         reading_type = primary_counter.get("readingType", "counter").lower()
         counter_type = primary_counter.get("counterType", "")
-        
+
         if reading_type == "consumption":
-            # For consumption-based meters (e.g., electricity from grid operator):
-            # Create statistics sensor for Energy Dashboard + consumption sensor for 30-day usage
+            # Statistics sensor for the Energy Dashboard + virtual meter reading
             if counter_type in consumable_counter_types:
-                sensors.append(MaalerportalStatisticSensor(
-                    installation, api_key, smarthome_base_url, primary_counter, polling_interval
-                ))
-                sensors.append(MaalerportalConsumptionSensor(
-                    installation, api_key, smarthome_base_url, primary_counter, polling_interval
-                ))
+                sensors.append(MaalerportalStatisticSensor(coordinator, primary_counter))
+                sensors.append(MaalerportalConsumptionSensor(coordinator, primary_counter))
         else:
-            # For counter-based meters (cumulative readings):
-            # Create main sensor showing current meter reading
-            sensors.append(MaalerportalMainSensor(
-                installation, api_key, smarthome_base_url, primary_counter, polling_interval
-            ))
-            # Also add statistics sensor to load historical data (last 30 days)
+            # Meter reading sensor + statistics sensor with history
+            sensors.append(MaalerportalMainSensor(coordinator, primary_counter))
             if counter_type in consumable_counter_types:
-                sensors.append(MaalerportalStatisticSensor(
-                    installation, api_key, smarthome_base_url, primary_counter, polling_interval
-                ))
-        
+                sensors.append(MaalerportalStatisticSensor(coordinator, primary_counter))
+
         # Add price sensor for primary counter if price is available
         if primary_counter.get("pricePerUnit") is not None:
-            sensors.append(MaalerportalPriceSensor(
-                installation, api_key, smarthome_base_url, primary_counter, polling_interval
-            ))
-    
+            sensors.append(MaalerportalPriceSensor(coordinator, primary_counter))
+
     # Create additional sensors for other counter types
     for counter in meter_counters:
         counter_type = counter.get("counterType", "")
         is_primary = counter.get("isPrimary", False)
-        
+
         if counter_type == "BatteryDaysRemaining":
-            sensors.append(MaalerportalBatterySensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalBatterySensor(coordinator, counter))
         elif counter_type in ["DailyMaxAmbientTemp", "DailyMinAmbientTemp"]:
-            sensors.append(MaalerportalTemperatureSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalTemperatureSensor(coordinator, counter))
         elif counter_type in ["DailyMaxWaterTemp", "DailyMinWaterTemp"]:
-            sensors.append(MaalerportalWaterTemperatureSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalWaterTemperatureSensor(coordinator, counter))
         elif counter_type in ["DailyMaxFlow1", "DailyMinFlow1"]:
-            sensors.append(MaalerportalFlowSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalFlowSensor(coordinator, counter))
         # Heat meter specific sensors
         elif counter_type in supply_temp_types:
-            sensors.append(MaalerportalSupplyTempSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalSupplyTempSensor(coordinator, counter))
         elif counter_type in return_temp_types:
-            sensors.append(MaalerportalReturnTempSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalReturnTempSensor(coordinator, counter))
         elif counter_type in temp_diff_types:
-            sensors.append(MaalerportalTempDiffSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalTempDiffSensor(coordinator, counter))
         elif counter_type in heat_power_types:
-            sensors.append(MaalerportalHeatPowerSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalHeatPowerSensor(coordinator, counter))
         elif counter_type in heat_volume_types:
-            sensors.append(MaalerportalHeatVolumeSensor(
-                installation, api_key, smarthome_base_url, counter, polling_interval
-            ))
+            sensors.append(MaalerportalHeatVolumeSensor(coordinator, counter))
         elif not is_primary and counter_type in consumable_counter_types:
             # Secondary meters - sensors depend on reading type
             reading_type = counter.get("readingType", "counter").lower()
-            
             if reading_type == "consumption":
-                # For consumption-based: statistics sensor + consumption sensor
-                sensors.append(MaalerportalStatisticSensor(
-                    installation, api_key, smarthome_base_url, counter, polling_interval
-                ))
-                sensors.append(MaalerportalConsumptionSensor(
-                    installation, api_key, smarthome_base_url, counter, polling_interval
-                ))
+                sensors.append(MaalerportalStatisticSensor(coordinator, counter))
+                sensors.append(MaalerportalConsumptionSensor(coordinator, counter))
             else:
-                # For counter-based: meter reading sensor + statistics for historical data
-                sensors.append(MaalerportalSecondarySensor(
-                    installation, api_key, smarthome_base_url, counter, polling_interval
-                ))
-                sensors.append(MaalerportalStatisticSensor(
-                    installation, api_key, smarthome_base_url, counter, polling_interval
-                ))
+                sensors.append(MaalerportalSecondarySensor(coordinator, counter))
+                sensors.append(MaalerportalStatisticSensor(coordinator, counter))
 
     # Diagnostics: when we last reached Målerportal, and when the meter last reported.
-    sensors.append(MaalerportalLastApiContactSensor(
-        installation, api_key, smarthome_base_url, primary_counter, polling_interval
-    ))
-    sensors.append(MaalerportalLastMeterReadingSensor(
-        installation, api_key, smarthome_base_url, primary_counter, polling_interval
-    ))
+    sensors.append(MaalerportalLastApiContactSensor(coordinator, primary_counter))
+    sensors.append(MaalerportalLastMeterReadingSensor(coordinator, primary_counter))
 
     return sensors
 
 
-class MaalerportalBaseSensor(SensorEntity):
+class MaalerportalBaseSensor(CoordinatorEntity[MaalerportalCoordinator], SensorEntity):
     """Base class for all Målerportal sensors."""
-    
+
     _attr_has_entity_name = True
-    
+
     # Translation map for installation/meter types
     METER_TYPE_TRANSLATIONS = {
         "ColdWater": "Koldt vand",
@@ -314,40 +296,16 @@ class MaalerportalBaseSensor(SensorEntity):
         "Gas": "Gas",
     }
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict = None,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict | None = None) -> None:
         """Initialize the sensor."""
+        super().__init__(coordinator)
+        installation = coordinator.installation
         self._installation = installation
-        self._api_key = api_key
-        self._smarthome_base_url = smarthome_base_url
         self._installation_id = installation["installationId"]
         self._installation_type = installation["installationType"]
         self._counter = counter
-        self._polling_interval = polling_interval
-        self._last_fetch_started: Optional[datetime] = None
-        
-        # Rate limiting
-        self._rate_limit_delay = 2000  # 2 seconds between requests
-        
-        # Last contact tracking
-        self._last_contact: Optional[datetime] = None
         self._last_reading_timestamp: Optional[str] = None
-        
-        # Installation availability tracking (for 404 handling)
-        self._installation_available: bool = True
-        self._last_availability_check: Optional[datetime] = None
-        self._unavailable_since: Optional[datetime] = None
-        self._availability_check_count: int = 0
-        self._base_check_interval = timedelta(minutes=15)  # Base interval: 15 minutes
-        self._max_check_interval = timedelta(hours=24)  # Max interval: 24 hours
-        self._max_unavailable_days: int = 30  # Stop checking after 30 days
-        
+
         # Create base device name
         self._base_device_name = f"{installation['address']} - {installation['meterSerial']}"
         if installation.get("nickname"):
@@ -375,13 +333,23 @@ class MaalerportalBaseSensor(SensorEntity):
         )
 
     @property
+    def available(self) -> bool:
+        """Available once data has arrived.
+
+        A failed poll keeps the last value instead of making the sensor
+        unavailable: meters report rarely, and a short outage at the gateway
+        should not punch holes in the history.
+        """
+        return self.coordinator.data is not None
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra state attributes."""
         attrs: dict[str, Any] = {
             "installation_id": self._installation_id,
         }
-        if self._last_contact:
-            attrs["last_contact"] = self._last_contact.isoformat()
+        if self.coordinator.last_contact:
+            attrs["last_contact"] = self.coordinator.last_contact.isoformat()
         if self._last_reading_timestamp:
             attrs["last_reading_timestamp"] = self._last_reading_timestamp
         if self._counter:
@@ -389,281 +357,80 @@ class MaalerportalBaseSensor(SensorEntity):
             attrs["meter_counter_id"] = self._counter.get("meterCounterId", "")
         return attrs
 
-    @property
-    def _fetch_interval(self) -> timedelta:
-        """How long to wait between fetches; the entry's polling interval."""
-        return self._polling_interval
+    async def async_added_to_hass(self) -> None:
+        """Take the values the coordinator already has, so the sensor starts with them."""
+        await super().async_added_to_hass()
+        if self.coordinator.data:
+            self._update_from_counters(self.coordinator.data.get("meterCounters", []))
 
-    async def async_update(self) -> None:
-        """Fetch from the API when the configured polling interval has passed.
-
-        Home Assistant polls sensors every 30 seconds; the interval the user set
-        in the options decides how often that poll actually reaches Målerportal.
-        """
-        now = dt_util.utcnow()
-        last = self._last_fetch_started
-        if last is not None and now - last < self._fetch_interval:
-            return
-        self._last_fetch_started = now
-        await self._async_fetch()
-
-    async def async_refresh(self) -> None:
-        """Fetch now, regardless of the polling interval, and publish the state."""
-        self._last_fetch_started = dt_util.utcnow()
-        await self._async_fetch()
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Update from the coordinator's latest data."""
+        if self.coordinator.data:
+            self._update_from_counters(self.coordinator.data.get("meterCounters", []))
         self.async_write_ha_state()
 
-    async def _async_fetch(self) -> None:
-        """Fetch data from API."""
-        # If installation is unavailable, only do periodic availability checks
-        if not self._installation_available:
-            await self._check_installation_availability()
-            return
-        
-        try:
-            _LOGGER.debug("Fetching meter readings for installation: %s", self._installation_id)
-            
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
-                # Get latest readings from new API
-                response = await session.get(
-                    f"{self._smarthome_base_url}/installations/{self._installation_id}/readings/latest",
-                    headers={"ApiKey": self._api_key},
-                )
+    def _update_from_counters(self, meter_counters: list[dict]) -> None:
+        """Update sensor state from meter counter data - implemented by subclasses."""
 
-                if response.status == 401:
-                    raise ConfigEntryAuthFailed("API key invalid or expired")
+    async def async_force_refresh(self) -> None:
+        """Fetch what only this sensor fetches, ignoring intervals (refresh service)."""
 
-                if response.status == 429:
-                    _LOGGER.warning("Rate limit exceeded, will retry later")
-                    self._rate_limit_delay = min(self._rate_limit_delay * 2, 10000)
-                    return
-
-                # Handle 404/403 - installation no longer accessible
-                if response.status in (404, 403):
-                    _LOGGER.warning(
-                        "Installation %s no longer accessible (HTTP %s), starting availability checks",
-                        self._installation_id,
-                        response.status
-                    )
-                    await self._handle_installation_unavailable()
-                    return
-
-                if not response.ok:
-                    _LOGGER.error("API request failed: HTTP %s", response.status)
-                    return
-
-                # Reset rate limit delay on success
-                self._rate_limit_delay = 2000
-                
-                # Update last contact time
-                self._last_contact = dt_util.utcnow()
-
-                readings_data = await response.json()
-                _LOGGER.debug("Readings data: %s", readings_data)
-
-                if readings_data.get("meterCounters"):
-                    await self._update_from_meter_counters(readings_data["meterCounters"])
-                else:
-                    _LOGGER.debug("No meter counters found in API response")
-
-        except ConfigEntryAuthFailed:
-            self._async_start_reauth()
-            raise
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timeout fetching meter readings for installation: %s", self._installation_id)
-        except aiohttp.ClientError as err:
-            _LOGGER.error("Connection error: %s", err)
-        except Exception as err:
-            _LOGGER.exception("Unexpected error fetching meter readings: %s", err)
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update sensor state from meter counter data - to be implemented by subclasses."""
-        pass
-
-    async def _handle_installation_unavailable(self) -> None:
-        """Handle installation becoming unavailable (404/403 response).
-        
-        Marks the installation as unavailable and sets up periodic availability checks
-        with exponential backoff.
-        """
-        if not self._installation_available:
-            # Already marked as unavailable
-            return
-        
-        self._installation_available = False
-        self._unavailable_since = datetime.now(timezone.utc)
-        self._availability_check_count = 0
-        self._last_availability_check = datetime.now(timezone.utc)
-        _LOGGER.warning(
-            "Installation %s marked as unavailable. Will check periodically for restoration (max %d days).",
-            self._installation_id,
-            self._max_unavailable_days
-        )
-
-    def _get_current_check_interval(self) -> timedelta:
-        """Calculate current check interval using exponential backoff.
-        
-        Starts at 15 minutes, doubles each check, max 24 hours.
-        """
-        # Exponential backoff: 15min, 30min, 1hr, 2hr, 4hr, 8hr, 16hr, 24hr (max)
-        multiplier = 2 ** self._availability_check_count
-        interval = self._base_check_interval * multiplier
-        return min(interval, self._max_check_interval)
-
-    async def _check_installation_availability(self) -> bool:
-        """Check if the installation is available again.
-        
-        Checks the /addresses endpoint to see if the installation exists.
-        Uses exponential backoff and stops after max_unavailable_days.
-        
-        Returns True if installation is available, False otherwise.
-        """
-        now = datetime.now(timezone.utc)
-        
-        # Check if we've exceeded max unavailable days - stop checking
-        if self._unavailable_since:
-            days_unavailable = (now - self._unavailable_since).days
-            if days_unavailable >= self._max_unavailable_days:
-                _LOGGER.warning(
-                    "Installation %s has been unavailable for %d days (max: %d). "
-                    "Stopping availability checks. Re-configure integration if access is restored.",
-                    self._installation_id,
-                    days_unavailable,
-                    self._max_unavailable_days
-                )
-                return False
-        
-        # Calculate current check interval based on exponential backoff
-        current_interval = self._get_current_check_interval()
-        
-        # Throttle availability checks based on current interval
-        if self._last_availability_check:
-            time_since_last_check = now - self._last_availability_check
-            if time_since_last_check < current_interval:
-                _LOGGER.debug(
-                    "Skipping availability check (last check was %s ago, current interval is %s)",
-                    time_since_last_check,
-                    current_interval
-                )
-                return False
-        
-        # Increment check count for exponential backoff
-        self._availability_check_count += 1
-        self._last_availability_check = now
-        
-        try:
-            _LOGGER.debug(
-                "Checking if installation %s is available again (check #%d, next interval: %s)...",
-                self._installation_id,
-                self._availability_check_count,
-                self._get_current_check_interval()
-            )
-            
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
-                response = await session.get(
-                    f"{self._smarthome_base_url}/addresses",
-                    headers={"ApiKey": self._api_key},
-                )
-                
-                if response.status == 401:
-                    raise ConfigEntryAuthFailed("API key invalid or expired")
-
-                if response.status == 429:
-                    _LOGGER.warning("Rate limit exceeded during availability check")
-                    return False
-
-                if not response.ok:
-                    _LOGGER.debug("Availability check failed: HTTP %s", response.status)
-                    return False
-                
-                addresses = await response.json()
-                
-                # Check if our installation exists in the list
-                installation_found = False
-                for address in addresses:
-                    for installation in address.get("installations", []):
-                        if installation.get("installationId") == self._installation_id:
-                            installation_found = True
-                            break
-                    if installation_found:
-                        break
-                
-                if installation_found:
-                    _LOGGER.info(
-                        "Installation %s found again! Resuming normal operation.",
-                        self._installation_id
-                    )
-                    # Reset all availability tracking state
-                    self._installation_available = True
-                    self._unavailable_since = None
-                    self._availability_check_count = 0
-                    return True
-                else:
-                    _LOGGER.debug(
-                        "Installation %s still not found (check #%d), next check in %s",
-                        self._installation_id,
-                        self._availability_check_count,
-                        self._get_current_check_interval()
-                    )
-                    return False
-                    
-        except ConfigEntryAuthFailed:
-            self._async_start_reauth()
-            raise
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timeout during availability check for installation %s", self._installation_id)
-        except aiohttp.ClientError as err:
-            _LOGGER.error("Connection error during availability check: %s", err)
-        except Exception as err:
-            _LOGGER.exception("Unexpected error during availability check: %s", err)
-        
-        return False
+    def _own_counter(self, meter_counters: list[dict]) -> dict | None:
+        """This sensor's counter in a list of counters."""
+        if not self._counter:
+            return None
+        counter_id = self._counter.get("meterCounterId")
+        for counter in meter_counters:
+            if counter.get("meterCounterId") == counter_id:
+                return counter
+        return None
 
     def _parse_counter_value(self, counter: dict) -> Optional[float]:
-        """Parse and validate counter value."""
+        """Parse a counter's latest value; remember its timestamp."""
         latest_value = counter.get("latestValue")
         if latest_value is None:
             return None
-            
-        try:
-            if isinstance(latest_value, (int, float)):
-                numeric_value = float(latest_value)
-            elif isinstance(latest_value, str):
-                # Clean the string value - remove any non-numeric characters except decimal point
-                cleaned_value = latest_value.strip()
-                cleaned_value = re.sub(r'[^\d.-]', '', cleaned_value)
-                numeric_value = float(cleaned_value)
-            else:
-                _LOGGER.error("Unexpected value type: %s", type(latest_value))
-                return None
-                
-            # Validate the number
-            if not (isinstance(numeric_value, (int, float)) and not (numeric_value != numeric_value)):  # Check for NaN
-                _LOGGER.error("Invalid numeric value: %s", latest_value)
-                return None
-            
-            # Update last reading timestamp
-            if counter.get("latestTimestamp"):
-                self._last_reading_timestamp = counter.get("latestTimestamp")
-                
-            return numeric_value
-            
-        except (ValueError, TypeError) as err:
-            _LOGGER.error("Error parsing meter value '%s': %s", latest_value, err)
+        value = parse_number(latest_value)
+        if value is None:
+            _LOGGER.warning(
+                "Could not read value '%s' of counter %s on installation %s",
+                latest_value,
+                counter.get("meterCounterId"),
+                self._installation_id,
+            )
             return None
+        if counter.get("latestTimestamp"):
+            self._last_reading_timestamp = counter.get("latestTimestamp")
+        return value
 
-    @callback
-    def _async_start_reauth(self) -> None:
-        """Ask for a new key when the gateway rejects ours while running.
+    def _parse_meter_reading(self, counter: dict) -> Optional[float]:
+        """Parse a cumulative meter reading, refusing negative values.
 
-        Home Assistant only starts reauth by itself for ConfigEntryAuthFailed
-        raised during setup; from an entity update the exception is just
-        logged, so the entity has to start the flow. Starting it twice is
-        harmless, HA reuses the flow in progress.
+        A meter reading cannot be negative. Turning it positive would show a
+        made-up reading, so the sensor keeps its last value instead.
         """
-        entry = self.platform.config_entry if self.platform else None
-        if entry is not None:
-            entry.async_start_reauth(self.hass)
+        value = self._parse_counter_value(counter)
+        if value is not None and value < 0:
+            _LOGGER.warning(
+                "Ignoring negative meter reading %s for counter %s on installation %s",
+                value,
+                counter.get("meterCounterId"),
+                self._installation_id,
+            )
+            return None
+        return value
+
+    def _fire_meter_updated(self, old_value: Any, value: float, counter: dict) -> None:
+        if self.hass and (old_value is None or old_value != value):
+            self.hass.bus.async_fire(EVENT_METER_UPDATED, {
+                "installation_id": self._installation_id,
+                "meter_value": value,
+                "unit": counter.get("unit", ""),
+                "counter_type": counter.get("counterType", ""),
+                "timestamp": counter.get("latestTimestamp"),
+            })
+            _LOGGER.debug("Fired %s event for installation %s", EVENT_METER_UPDATED, self._installation_id)
 
     def _apply_counter_unit(
         self, default_unit: str | None, device_class: SensorDeviceClass | None
@@ -681,19 +448,12 @@ class MaalerportalBaseSensor(SensorEntity):
 class MaalerportalMainSensor(MaalerportalBaseSensor):
     """Main sensor for primary meter counter."""
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the main sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         self._attr_unique_id = f"{self._installation_id}_main"
-        
+
         # Translation key and the unit/device class expected for the counter type.
         # The unit the API reports wins when Home Assistant can handle it; the
         # expected unit is only the fallback for counters that report none.
@@ -716,50 +476,29 @@ class MaalerportalMainSensor(MaalerportalBaseSensor):
             self._attr_state_class = SensorStateClass.MEASUREMENT
         self._apply_counter_unit(default_unit, device_class)
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
+    def _update_from_counters(self, meter_counters: list[dict]) -> None:
         """Update main sensor from primary counter."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    # Ensure positive value for meters
-                    if value < 0:
-                        _LOGGER.warning("Negative meter value received, taking absolute value: %s", value)
-                        value = abs(value)
-                    
-                    # Check if value changed before firing event
-                    old_value = self._attr_native_value
-                    self._attr_native_value = value
-                    _LOGGER.debug("Updated main sensor value: %s %s", value, counter.get("unit", ""))
-                    
-                    # Fire event if value changed and hass is available
-                    if self.hass and (old_value is None or old_value != value):
-                        self.hass.bus.fire(EVENT_METER_UPDATED, {
-                            "installation_id": self._installation_id,
-                            "meter_value": value,
-                            "unit": counter.get("unit", ""),
-                            "counter_type": counter.get("counterType", ""),
-                            "timestamp": counter.get("latestTimestamp"),
-                        })
-                        _LOGGER.debug("Fired %s event for installation %s", EVENT_METER_UPDATED, self._installation_id)
-                break
+        counter = self._own_counter(meter_counters)
+        if counter is None:
+            return
+        value = self._parse_meter_reading(counter)
+        if value is None:
+            return
+        old_value = self._attr_native_value
+        self._attr_native_value = value
+        _LOGGER.debug("Updated main sensor value: %s %s", value, counter.get("unit", ""))
+        self._fire_meter_updated(old_value, value, counter)
 
 
 class MaalerportalBasicSensor(MaalerportalBaseSensor):
     """Basic fallback sensor when meter data is not available."""
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator) -> None:
         """Initialize the basic sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, polling_interval=polling_interval)
-        
+        super().__init__(coordinator)
+
         self._attr_unique_id = f"{self._installation_id}_basic"
-        
+
         # Set default attributes based on installation type
         installation_type = self._installation_type.lower()
         if installation_type in ["coldwater", "hotwater"]:
@@ -783,26 +522,18 @@ class MaalerportalBasicSensor(MaalerportalBaseSensor):
             self._attr_native_unit_of_measurement = None
             self._attr_state_class = SensorStateClass.MEASUREMENT
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
+    def _update_from_counters(self, meter_counters: list[dict]) -> None:
         """Update basic sensor from first available counter."""
-        if meter_counters:
-            # Find primary counter or use first one
-            primary_counter = None
-            for counter in meter_counters:
-                if counter.get("isPrimary", False):
-                    primary_counter = counter
-                    break
-            
-            if not primary_counter:
-                primary_counter = meter_counters[0]
-            
-            value = self._parse_counter_value(primary_counter)
-            if value is not None:
-                if value < 0:
-                    value = abs(value)
-                
-                self._attr_native_value = value
-                _LOGGER.debug("Updated basic sensor value: %s %s", value, primary_counter.get("unit", ""))
+        if not meter_counters:
+            return
+        primary_counter = next(
+            (counter for counter in meter_counters if counter.get("isPrimary", False)),
+            meter_counters[0],
+        )
+        value = self._parse_meter_reading(primary_counter)
+        if value is not None:
+            self._attr_native_value = value
+            _LOGGER.debug("Updated basic sensor value: %s %s", value, primary_counter.get("unit", ""))
 
 
 # Specialized sensor classes for different counter types
@@ -814,23 +545,16 @@ class MaalerportalLastApiContactSensor(MaalerportalBaseSensor):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:cloud-check-outline"
 
-    def __init__(
-        self,
-        installation: dict,
-        api_key: str,
-        smarthome_base_url: str,
-        counter: dict | None,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict | None) -> None:
         """Initialize the last API contact sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
+        super().__init__(coordinator, counter)
         self._attr_translation_key = "last_api_contact"
         self._attr_unique_id = f"{self._installation_id}_last_api_contact"
 
     @property
     def native_value(self) -> Optional[datetime]:
         """Return the time of the last successful API response."""
-        return self._last_contact
+        return self.coordinator.last_contact
 
 
 class MaalerportalLastMeterReadingSensor(MaalerportalBaseSensor):
@@ -840,46 +564,49 @@ class MaalerportalLastMeterReadingSensor(MaalerportalBaseSensor):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:counter"
 
-    def __init__(
-        self,
-        installation: dict,
-        api_key: str,
-        smarthome_base_url: str,
-        counter: dict | None,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict | None) -> None:
         """Initialize the last meter reading sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
+        super().__init__(coordinator, counter)
         self._attr_translation_key = "last_meter_reading"
         self._attr_unique_id = f"{self._installation_id}_last_meter_reading"
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
+    def _update_from_counters(self, meter_counters: list[dict]) -> None:
         """Take the newest reading timestamp reported by any counter on the meter."""
         timestamps = [
             parsed
             for counter in meter_counters
-            if (raw := counter.get("latestTimestamp"))
-            and (parsed := dt_util.parse_datetime(raw)) is not None
+            if (parsed := parse_api_timestamp(counter.get("latestTimestamp"))) is not None
         ]
         if timestamps:
-            self._attr_native_value = dt_util.as_utc(max(timestamps))
+            self._attr_native_value = max(timestamps)
             _LOGGER.debug("Updated last meter reading: %s", self._attr_native_value)
+
+
+class _RoundedCounterSensor(MaalerportalBaseSensor):
+    """A sensor showing its counter's latest value, rounded."""
+
+    _round_to: int | None = None
+
+    def _update_from_counters(self, meter_counters: list[dict]) -> None:
+        counter = self._own_counter(meter_counters)
+        if counter is None:
+            return
+        value = self._parse_counter_value(counter)
+        if value is None:
+            return
+        self._attr_native_value = round(value, self._round_to) if self._round_to is not None else value
+        _LOGGER.debug(
+            "Updated %s: %s %s", self.unique_id, value, self._attr_native_unit_of_measurement or ""
+        )
 
 
 class MaalerportalBatterySensor(MaalerportalBaseSensor):
     """Battery days remaining sensor."""
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the battery sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         self._attr_translation_key = "battery_days"
         self._attr_unique_id = f"{self._installation_id}_battery_days"
         self._attr_device_class = SensorDeviceClass.DURATION
@@ -887,7 +614,7 @@ class MaalerportalBatterySensor(MaalerportalBaseSensor):
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:battery"
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
+    def _update_from_counters(self, meter_counters: list[dict]) -> None:
         """Update battery sensor."""
         for counter in meter_counters:
             if counter.get("counterType") == "BatteryDaysRemaining":
@@ -898,20 +625,15 @@ class MaalerportalBatterySensor(MaalerportalBaseSensor):
                 break
 
 
-class MaalerportalTemperatureSensor(MaalerportalBaseSensor):
+class MaalerportalTemperatureSensor(_RoundedCounterSensor):
     """Ambient temperature sensor."""
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    _round_to = 1
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the temperature sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         counter_type = counter.get("counterType", "")
         if "Max" in counter_type:
             self._attr_translation_key = "max_ambient_temperature"
@@ -919,36 +641,21 @@ class MaalerportalTemperatureSensor(MaalerportalBaseSensor):
         else:
             self._attr_translation_key = "min_ambient_temperature"
             self._attr_unique_id = f"{self._installation_id}_temp_ambient_min"
-            
+
         self._attr_device_class = SensorDeviceClass.TEMPERATURE
         self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
         self._attr_state_class = SensorStateClass.MEASUREMENT
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update temperature sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = round(value, 1)
-                    _LOGGER.debug("Updated ambient temperature: %s°C", value)
-                break
 
-
-class MaalerportalWaterTemperatureSensor(MaalerportalBaseSensor):
+class MaalerportalWaterTemperatureSensor(_RoundedCounterSensor):
     """Water temperature sensor."""
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    _round_to = 1
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the water temperature sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         counter_type = counter.get("counterType", "")
         if "Max" in counter_type:
             self._attr_translation_key = "max_water_temperature"
@@ -956,36 +663,21 @@ class MaalerportalWaterTemperatureSensor(MaalerportalBaseSensor):
         else:
             self._attr_translation_key = "min_water_temperature"
             self._attr_unique_id = f"{self._installation_id}_temp_water_min"
-            
+
         self._attr_device_class = SensorDeviceClass.TEMPERATURE
         self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
         self._attr_state_class = SensorStateClass.MEASUREMENT
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update water temperature sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = round(value, 1)
-                    _LOGGER.debug("Updated water temperature: %s°C", value)
-                break
 
-
-class MaalerportalFlowSensor(MaalerportalBaseSensor):
+class MaalerportalFlowSensor(_RoundedCounterSensor):
     """Flow sensor."""
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    _round_to = 3
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the flow sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         counter_type = counter.get("counterType", "")
         if "Max" in counter_type:
             self._attr_translation_key = "max_flow"
@@ -993,7 +685,7 @@ class MaalerportalFlowSensor(MaalerportalBaseSensor):
         else:
             self._attr_translation_key = "min_flow"
             self._attr_unique_id = f"{self._installation_id}_flow_min"
-            
+
         # Flow is L/h unless the utility reports otherwise. With the volume-flow-rate
         # device class Home Assistant converts between m³/h, L/min etc. itself and
         # lets the user pick a display unit on the entity.
@@ -1001,33 +693,16 @@ class MaalerportalFlowSensor(MaalerportalBaseSensor):
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:water-pump"
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update flow sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = round(value, 3)
-                    _LOGGER.debug("Updated flow: %s %s", value, self._attr_native_unit_of_measurement)
-                break
-
 
 class MaalerportalSecondarySensor(MaalerportalBaseSensor):
     """Secondary meter sensor."""
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the secondary sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         counter_type = counter.get("counterType", "")
-        
+
         # Translation key and the unit/device class expected for the counter type.
         # The unit the API reports wins when Home Assistant can handle it.
         if counter_type == "ColdWater":
@@ -1049,51 +724,34 @@ class MaalerportalSecondarySensor(MaalerportalBaseSensor):
             self._attr_translation_key = "meter_reading"
             default_unit, device_class = None, None
         self._apply_counter_unit(default_unit, device_class)
-        
+
         self._attr_unique_id = f"{self._installation_id}_{counter_type.lower()}_secondary"
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
+    def _update_from_counters(self, meter_counters: list[dict]) -> None:
         """Update secondary sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    if value < 0:
-                        value = abs(value)
-                    
-                    # Check if value changed before firing event
-                    old_value = self._attr_native_value
-                    self._attr_native_value = value
-                    _LOGGER.debug("Updated secondary sensor %s: %s %s", 
-                                self._counter.get("counterType"), value, counter.get("unit", ""))
-                    
-                    # Fire event if value changed and hass is available
-                    if self.hass and (old_value is None or old_value != value):
-                        self.hass.bus.fire(EVENT_METER_UPDATED, {
-                            "installation_id": self._installation_id,
-                            "meter_value": value,
-                            "unit": counter.get("unit", ""),
-                            "counter_type": counter.get("counterType", ""),
-                            "timestamp": counter.get("latestTimestamp"),
-                        })
-                break
+        counter = self._own_counter(meter_counters)
+        if counter is None:
+            return
+        value = self._parse_meter_reading(counter)
+        if value is None:
+            return
+        old_value = self._attr_native_value
+        self._attr_native_value = value
+        _LOGGER.debug(
+            "Updated secondary sensor %s: %s %s",
+            counter.get("counterType"), value, counter.get("unit", ""),
+        )
+        self._fire_meter_updated(old_value, value, counter)
 
 
 class MaalerportalPriceSensor(MaalerportalBaseSensor):
     """Price per unit sensor for primary counters."""
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the price sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         unit = counter.get("unit", "unit")
         self._attr_translation_key = "price_per_unit"
         self._attr_unique_id = f"{self._installation_id}_price_per_unit"
@@ -1101,52 +759,202 @@ class MaalerportalPriceSensor(MaalerportalBaseSensor):
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:currency-usd"
 
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
+    def _update_from_counters(self, meter_counters: list[dict]) -> None:
         """Update price sensor."""
-        for counter in meter_counters:
-            if (counter.get("meterCounterId") == self._counter.get("meterCounterId") and 
-                counter.get("isPrimary", False)):
-                price_per_unit = counter.get("pricePerUnit")
-                if price_per_unit is not None:
-                    # Convert from øre to kroner (divide by 100)
-                    price_in_kroner = price_per_unit / 100
-                    self._attr_native_value = round(price_in_kroner, 4)
-                    _LOGGER.debug("Updated price per unit: %s kr/%s", 
-                                price_in_kroner, counter.get("unit", ""))
-                break
+        counter = self._own_counter(meter_counters)
+        if counter is None or not counter.get("isPrimary", False):
+            return
+        price_per_unit = parse_number(counter.get("pricePerUnit"))
+        if price_per_unit is not None:
+            # Convert from øre to kroner (divide by 100)
+            price_in_kroner = price_per_unit / 100
+            self._attr_native_value = round(price_in_kroner, 4)
+            _LOGGER.debug("Updated price per unit: %s kr/%s", price_in_kroner, counter.get("unit", ""))
 
 
-class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
-    """Consumption sensor that shows virtual cumulative meter reading.
-    
-    For consumption-type meters (readingType=consumption), this sensor tracks
-    a virtual cumulative meter reading by summing all consumption values.
-    This is useful for display purposes while the StatisticSensor handles
-    Energy Dashboard integration.
+# Heat meter specific sensors
+
+class MaalerportalSupplyTempSensor(_RoundedCounterSensor):
+    """Supply/flow temperature sensor for heat meters."""
+
+    _round_to = 1
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
+        """Initialize the supply temperature sensor."""
+        super().__init__(coordinator, counter)
+
+        self._attr_translation_key = "supply_temperature"
+        self._attr_unique_id = f"{self._installation_id}_temp_supply"
+        self._attr_device_class = SensorDeviceClass.TEMPERATURE
+        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_icon = "mdi:thermometer-chevron-up"
+
+
+class MaalerportalReturnTempSensor(_RoundedCounterSensor):
+    """Return temperature sensor for heat meters."""
+
+    _round_to = 1
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
+        """Initialize the return temperature sensor."""
+        super().__init__(coordinator, counter)
+
+        self._attr_translation_key = "return_temperature"
+        self._attr_unique_id = f"{self._installation_id}_temp_return"
+        self._attr_device_class = SensorDeviceClass.TEMPERATURE
+        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_icon = "mdi:thermometer-chevron-down"
+
+
+class MaalerportalTempDiffSensor(_RoundedCounterSensor):
+    """Temperature difference sensor for heat meters."""
+
+    _round_to = 1
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
+        """Initialize the temperature difference sensor."""
+        super().__init__(coordinator, counter)
+
+        self._attr_translation_key = "temperature_difference"
+        self._attr_unique_id = f"{self._installation_id}_temp_diff"
+        self._attr_device_class = SensorDeviceClass.TEMPERATURE
+        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_icon = "mdi:thermometer-lines"
+
+
+class MaalerportalHeatPowerSensor(_RoundedCounterSensor):
+    """Heat power/effect sensor for heat meters."""
+
+    _round_to = 2
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
+        """Initialize the heat power sensor."""
+        super().__init__(coordinator, counter)
+
+        self._attr_translation_key = "heat_power"
+        self._attr_unique_id = f"{self._installation_id}_heat_power"
+        self._apply_counter_unit(UnitOfPower.KILO_WATT, SensorDeviceClass.POWER)
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_icon = "mdi:fire"
+
+
+class MaalerportalHeatVolumeSensor(_RoundedCounterSensor):
+    """Heat volume sensor for heat meters."""
+
+    _round_to = 3
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
+        """Initialize the heat volume sensor."""
+        super().__init__(coordinator, counter)
+
+        self._attr_translation_key = "heat_volume"
+        self._attr_unique_id = f"{self._installation_id}_heat_volume"
+        self._apply_counter_unit(UnitOfVolume.CUBIC_METERS, SensorDeviceClass.WATER)
+        self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+        self._attr_icon = "mdi:water-thermometer"
+
+
+# Sensors built from historical readings
+
+class _HistorySensor(MaalerportalBaseSensor):
+    """A sensor that works on /readings/historical, at most once an hour."""
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
+        super().__init__(coordinator, counter)
+        self._history_lock = asyncio.Lock()
+        self._last_history_run: datetime | None = None
+
+    @property
+    def _history_interval(self) -> timedelta:
+        return max(self.coordinator.update_interval or MIN_HISTORY_INTERVAL, MIN_HISTORY_INTERVAL)
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._schedule_history_run()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._schedule_history_run()
+        super()._handle_coordinator_update()
+
+    @callback
+    def _schedule_history_run(self) -> None:
+        if self._history_lock.locked():
+            return
+        last = self._last_history_run
+        if last is not None and dt_util.utcnow() - last < self._history_interval:
+            return
+        self.hass.async_create_task(self._async_run_history(), eager_start=False)
+
+    async def async_force_refresh(self) -> None:
+        await self._async_run_history(force=True)
+
+    async def _async_run_history(self, force: bool = False) -> None:
+        async with self._history_lock:
+            now = dt_util.utcnow()
+            last = self._last_history_run
+            if not force and last is not None and now - last < self._history_interval:
+                return
+            self._last_history_run = now
+            try:
+                done = await self._async_process_history(force)
+            except Exception:  # noqa: BLE001 - never let one round kill the sensor
+                _LOGGER.exception("Error updating history for %s", self.entity_id)
+                done = False
+            if not done:
+                # Try again on the next coordinator update instead of in an hour.
+                self._last_history_run = last
+
+    async def _async_process_history(self, force: bool) -> bool:
+        """Do one history round; False if the API could not be asked."""
+        raise NotImplementedError
+
+
+@dataclass
+class _VirtualMeterData(ExtraStoredData):
+    """What the virtual meter keeps across restarts."""
+
+    total: float
+    seen: dict[str, float]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"total": self.total, "seen": self.seen}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> _VirtualMeterData | None:
+        try:
+            return cls(float(data["total"]), {str(k): float(v) for k, v in data["seen"].items()})
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+
+
+class MaalerportalConsumptionSensor(_HistorySensor, RestoreEntity):
+    """Virtual cumulative meter reading for consumption-type counters.
+
+    Adds up every consumption reading it has seen. Readings are remembered by
+    timestamp for a month, so a reading the utility delivers late is still
+    added, and a corrected reading adds only the difference.
     """
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    # Readings older than this are forgotten; the API never sends older ones
+    # on a regular round.
+    _SEEN_RETENTION = timedelta(days=MAX_HISTORY_DAYS + 2)
+
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the consumption sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         counter_type = counter.get("counterType", "")
         is_primary = counter.get("isPrimary", False)
-        
-        # Get installation type to distinguish hot vs cold water
-        # (counter_type may always be "ColdWater" for water meters)
-        installation_type = installation.get("installationType", "").lower()
-        
-        # Set translation key based on counter type - these show virtual meter reading.
-        # The unit the API reports wins when Home Assistant can handle it.
+
+        # counter_type may always be "ColdWater" for water meters, so the
+        # installation type tells hot from cold water.
+        installation_type = coordinator.installation.get("installationType", "").lower()
+
         if counter_type == "ColdWater" or counter_type == "HotWater":
-            # Use installation type to determine if it's hot or cold water
             if installation_type == "hotwater":
                 self._attr_translation_key = "virtual_hot_water_meter"
             else:
@@ -1165,19 +973,18 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
             self._attr_translation_key = "virtual_meter"
             default_unit, device_class = None, None
         self._apply_counter_unit(default_unit, device_class)
-        
-        # Create unique ID based on counter type and primary/secondary status
+
         suffix = "primary" if is_primary else "secondary"
         self._attr_unique_id = f"{self._installation_id}_{counter_type.lower()}_consumption_{suffix}"
-        
-        # Use TOTAL_INCREASING for cumulative virtual meter reading
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         self._attr_icon = "mdi:counter"
-        
-        # Virtual cumulative meter reading
+
         self._cumulative_sum: float = 0.0
-        self._last_processed_timestamp: Optional[datetime] = None
-        self._initialized: bool = False
+        # Reading timestamp (ISO, UTC) -> consumption already added.
+        self._seen: dict[str, float] = {}
+        # Set when restored from an older version that only kept the newest
+        # processed timestamp: readings up to it are already in the total.
+        self._legacy_cutoff: datetime | None = None
 
     @property
     def native_value(self) -> Optional[float]:
@@ -1188,404 +995,118 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return extra state attributes for persistence."""
+        """Return extra state attributes."""
         attrs = super().extra_state_attributes
         if self._cumulative_sum > 0:
             attrs["cumulative_sum"] = self._cumulative_sum
-        if self._last_processed_timestamp:
-            attrs["last_processed_timestamp"] = self._last_processed_timestamp.isoformat()
+        if self._seen:
+            attrs["last_processed_timestamp"] = max(self._seen)
         attrs["virtual_meter"] = True
         return attrs
 
-    async def async_added_to_hass(self) -> None:
-        """Restore previous state when entity is added to hass."""
-        await super().async_added_to_hass()
-        
-        # Restore previous state
-        last_state = await self.async_get_last_state()
-        if last_state is not None:
-            # Restore cumulative sum from state
-            if last_state.state not in (None, "unknown", "unavailable"):
-                try:
-                    self._cumulative_sum = float(last_state.state)
-                    _LOGGER.debug(
-                        "Restored virtual meter reading for %s: %s",
-                        self._attr_unique_id,
-                        self._cumulative_sum
-                    )
-                except (ValueError, TypeError):
-                    pass
-            
-            # Restore last processed timestamp from attributes
-            if last_state.attributes:
-                timestamp_str = last_state.attributes.get("last_processed_timestamp")
-                if timestamp_str:
-                    try:
-                        self._last_processed_timestamp = datetime.fromisoformat(timestamp_str)
-                    except (ValueError, TypeError):
-                        pass
-        
-        self._initialized = True
-        # Fetch initial data
-        await self._fetch_and_accumulate()
-
     @property
-    def _fetch_interval(self) -> timedelta:
-        """Consumption arrives per hour, so never fetch it more often than that."""
-        return max(self._polling_interval, timedelta(hours=1))
+    def extra_restore_state_data(self) -> _VirtualMeterData:
+        return _VirtualMeterData(self._cumulative_sum, dict(self._seen))
 
-    async def _async_fetch(self) -> None:
-        """Fetch new consumption data and update cumulative sum."""
-        # If installation is unavailable, only do periodic availability checks
-        if not self._installation_available:
-            await self._check_installation_availability()
-            return
-        
-        if self._initialized:
-            await self._fetch_and_accumulate()
+    async def async_added_to_hass(self) -> None:
+        """Restore the running total before the first history round."""
+        if (extra := await self.async_get_last_extra_data()) is not None and (
+            data := _VirtualMeterData.from_dict(extra.as_dict())
+        ) is not None:
+            self._cumulative_sum = data.total
+            self._seen = data.seen
+        elif (last_state := await self.async_get_last_state()) is not None:
+            # Restored from a version before this one.
+            if (value := parse_number(last_state.state)) is not None:
+                self._cumulative_sum = value
+            self._legacy_cutoff = parse_api_timestamp(
+                last_state.attributes.get("last_processed_timestamp")
+            )
+            if self._cumulative_sum > 0 and self._legacy_cutoff is None:
+                # A total without a timestamp: count only what comes from now on.
+                self._legacy_cutoff = dt_util.utcnow()
+        await super().async_added_to_hass()
 
-    async def _fetch_and_accumulate(self) -> None:
-        """Fetch historical consumption data and accumulate into virtual meter reading."""
-        try:
-            counter_id = self._counter.get("meterCounterId")
-            if not counter_id:
-                _LOGGER.warning("No meterCounterId available for consumption sensor")
-                return
-            
-            now = datetime.now(timezone.utc)
-            self._last_contact = now
-            
-            # Calculate date range. API allows max 31 days per request, so cap the
-            # window at 30 days even if our last seen reading is older (e.g. meter
-            # has been silent for months) — otherwise every poll fires an invalid
-            # 6-month request that the API rejects. The reading-timestamp filter
-            # below still admits any genuinely new readings inside the window.
-            window_start = now - timedelta(days=30)
-            if self._last_processed_timestamp and self._last_processed_timestamp > window_start:
-                start_date = self._last_processed_timestamp
+    def _history_days(self) -> int:
+        newest = max(
+            (ts for key in self._seen if (ts := parse_api_timestamp(key)) is not None),
+            default=None,
+        )
+        if newest is None or self._legacy_cutoff is not None:
+            return MAX_HISTORY_DAYS
+        behind = (dt_util.utcnow() - newest).days + 2
+        return max(RECENT_HISTORY_DAYS, min(behind, MAX_HISTORY_DAYS))
+
+    async def _async_process_history(self, force: bool) -> bool:
+        readings = await self.coordinator.async_get_history(self._history_days(), force=force)
+        if readings is None:
+            return False
+        counter_id = self._counter.get("meterCounterId")
+        added = self.apply_readings(readings, counter_id)
+        if added:
+            _LOGGER.debug(
+                "Virtual meter %s: added %s, total now %s",
+                self.entity_id, added, self._cumulative_sum,
+            )
+        self.async_write_ha_state()
+        return True
+
+    def apply_readings(self, readings: list[dict], counter_id: str) -> float:
+        """Add the consumption of readings not counted yet; return what was added."""
+        added = 0.0
+        for reading in readings:
+            if reading.get("meterCounterId") != counter_id:
+                continue
+            timestamp = parse_api_timestamp(reading.get("timestamp"))
+            value = parse_number(reading.get("value"))
+            if timestamp is None or value is None:
+                continue
+            value = max(value, 0.0)
+            key = timestamp.isoformat()
+            if key in self._seen:
+                delta = max(value - self._seen[key], 0.0)
+                self._seen[key] = max(value, self._seen[key])
+            elif self._legacy_cutoff is not None and timestamp <= self._legacy_cutoff:
+                delta = 0.0
+                self._seen[key] = value
             else:
-                start_date = window_start
+                delta = value
+                self._seen[key] = value
+            added += delta
 
-            end_date = now
-            
-            # Format as ISO datetime strings for the API
-            start_date_iso = start_date.strftime("%Y-%m-%dT00:00:00Z")
-            end_date_iso = end_date.strftime("%Y-%m-%dT23:59:59Z")
-            
-            _LOGGER.debug("Fetching consumption for counter %s from %s to %s", 
-                          counter_id, start_date_iso, end_date_iso)
-            
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
-                # Use POST endpoint with JSON body
-                response = await session.post(
-                    f"{self._smarthome_base_url}/installations/{self._installation_id}/readings/historical",
-                    json={"from": start_date_iso, "to": end_date_iso},
-                    headers={"ApiKey": self._api_key, "Content-Type": "application/json"},
-                )
-                
-                if response.status == 401:
-                    raise ConfigEntryAuthFailed("API key invalid or expired")
-
-                if response.status == 429:
-                    _LOGGER.warning("Rate limit exceeded for historical data, will retry later")
-                    return
-
-                # Handle 404/403 - installation no longer accessible
-                if response.status in (404, 403):
-                    _LOGGER.warning(
-                        "Installation %s no longer accessible (HTTP %s)",
-                        self._installation_id,
-                        response.status
-                    )
-                    await self._handle_installation_unavailable()
-                    return
-
-                if not response.ok:
-                    _LOGGER.error("Historical data request failed: HTTP %s", response.status)
-                    return
-                
-                historical_data = await response.json()
-                
-                # Process readings for this specific counter
-                readings = historical_data.get("readings", [])
-                new_consumption = 0.0
-                valid_readings = 0
-                latest_timestamp: Optional[datetime] = None
-                
-                for reading in readings:
-                    # Filter by counter ID
-                    if reading.get("meterCounterId") != counter_id:
-                        continue
-                    
-                    # Parse timestamp
-                    timestamp_str = reading.get("timestamp")
-                    if not timestamp_str:
-                        continue
-                    
-                    try:
-                        # Handle both Z suffix and explicit timezone offsets
-                        if timestamp_str.endswith("Z"):
-                            reading_timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                        else:
-                            reading_timestamp = datetime.fromisoformat(timestamp_str)
-                        # Convert to UTC for consistency
-                        reading_timestamp = reading_timestamp.astimezone(timezone.utc)
-                    except (ValueError, TypeError):
-                        continue
-                    
-                    # Skip if already processed
-                    if self._last_processed_timestamp and reading_timestamp <= self._last_processed_timestamp:
-                        continue
-                    
-                    # Use the value field (consumption is None for grid operator data)
-                    consumption = reading.get("value")
-                    if consumption is not None:
-                        try:
-                            if isinstance(consumption, (int, float)):
-                                numeric_value = float(consumption)
-                            elif isinstance(consumption, str):
-                                cleaned_value = consumption.strip()
-                                cleaned_value = re.sub(r'[^\d.-]', '', cleaned_value)
-                                numeric_value = float(cleaned_value)
-                            else:
-                                continue
-                            
-                            if numeric_value >= 0:  # Only add positive values
-                                new_consumption += numeric_value
-                                valid_readings += 1
-                                
-                                # Track latest timestamp
-                                if latest_timestamp is None or reading_timestamp > latest_timestamp:
-                                    latest_timestamp = reading_timestamp
-                        except (ValueError, TypeError):
-                            continue
-                
-                if valid_readings > 0:
-                    self._cumulative_sum += new_consumption
-                    if latest_timestamp:
-                        self._last_processed_timestamp = latest_timestamp
-                    
-                    _LOGGER.debug(
-                        "Updated virtual meter for %s: added %s, total now %s %s (from %d new readings)",
-                        self._counter.get("counterType"),
-                        new_consumption,
-                        self._cumulative_sum,
-                        self._attr_native_unit_of_measurement,
-                        valid_readings
-                    )
-                else:
-                    _LOGGER.debug("No valid readings found for consumption calculation")
-                    
-        except ConfigEntryAuthFailed:
-            self._async_start_reauth()
-            raise
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timeout fetching historical data for consumption sensor")
-        except aiohttp.ClientError as err:
-            _LOGGER.error("Connection error fetching historical data: %s", err)
-        except Exception as err:
-            _LOGGER.exception("Unexpected error fetching historical data: %s", err)
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Not used for consumption sensor - we fetch historical data directly."""
-        pass
+        self._cumulative_sum += added
+        self._legacy_cutoff = None
+        oldest_kept = dt_util.utcnow() - self._SEEN_RETENTION
+        self._seen = {
+            key: value
+            for key, value in self._seen.items()
+            if (ts := parse_api_timestamp(key)) is not None and ts >= oldest_kept
+        }
+        return added
 
 
-# Heat meter specific sensors
+class MaalerportalStatisticSensor(_HistorySensor):
+    """Imports hourly history into Home Assistant's long-term statistics.
 
-class MaalerportalSupplyTempSensor(MaalerportalBaseSensor):
-    """Supply/flow temperature sensor for heat meters."""
+    For the Energy Dashboard. Utilities deliver readings with a delay, so the
+    rows are written into the statistics of this entity afterwards instead of
+    being recorded from its state, which stays unknown on purpose.
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
-        """Initialize the supply temperature sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
-        self._attr_translation_key = "supply_temperature"
-        self._attr_unique_id = f"{self._installation_id}_temp_supply"
-        self._attr_device_class = SensorDeviceClass.TEMPERATURE
-        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:thermometer-chevron-up"
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update supply temperature sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = round(value, 1)
-                    _LOGGER.debug("Updated supply temperature: %s°C", value)
-                break
-
-
-class MaalerportalReturnTempSensor(MaalerportalBaseSensor):
-    """Return temperature sensor for heat meters."""
-
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
-        """Initialize the return temperature sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
-        self._attr_translation_key = "return_temperature"
-        self._attr_unique_id = f"{self._installation_id}_temp_return"
-        self._attr_device_class = SensorDeviceClass.TEMPERATURE
-        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:thermometer-chevron-down"
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update return temperature sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = round(value, 1)
-                    _LOGGER.debug("Updated return temperature: %s°C", value)
-                break
-
-
-class MaalerportalTempDiffSensor(MaalerportalBaseSensor):
-    """Temperature difference sensor for heat meters."""
-
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
-        """Initialize the temperature difference sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
-        self._attr_translation_key = "temperature_difference"
-        self._attr_unique_id = f"{self._installation_id}_temp_diff"
-        self._attr_device_class = SensorDeviceClass.TEMPERATURE
-        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:thermometer-lines"
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update temperature difference sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = round(value, 1)
-                    _LOGGER.debug("Updated temperature difference: %s°C", value)
-                break
-
-
-class MaalerportalHeatPowerSensor(MaalerportalBaseSensor):
-    """Heat power/effect sensor for heat meters."""
-
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
-        """Initialize the heat power sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
-        self._attr_translation_key = "heat_power"
-        self._attr_unique_id = f"{self._installation_id}_heat_power"
-        self._apply_counter_unit(UnitOfPower.KILO_WATT, SensorDeviceClass.POWER)
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:fire"
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update heat power sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = round(value, 2)
-                    _LOGGER.debug("Updated heat power: %s %s", value, self._attr_native_unit_of_measurement)
-                break
-
-
-class MaalerportalHeatVolumeSensor(MaalerportalBaseSensor):
-    """Heat volume sensor for heat meters."""
-
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
-        """Initialize the heat volume sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
-        self._attr_translation_key = "heat_volume"
-        self._attr_unique_id = f"{self._installation_id}_heat_volume"
-        self._apply_counter_unit(UnitOfVolume.CUBIC_METERS, SensorDeviceClass.WATER)
-        self._attr_state_class = SensorStateClass.TOTAL_INCREASING
-        self._attr_icon = "mdi:water-thermometer"
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Update heat volume sensor."""
-        for counter in meter_counters:
-            if counter.get("meterCounterId") == self._counter.get("meterCounterId"):
-                value = self._parse_counter_value(counter)
-                if value is not None:
-                    self._attr_native_value = round(value, 3)
-                    _LOGGER.debug("Updated heat volume: %s %s", value, self._attr_native_unit_of_measurement)
-                break
-
-
-class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
-    """Statistics sensor for electricity meters - inserts historical data into HA's long-term statistics.
-    
-    This sensor is designed for meters where data is delayed (1-3 days from grid operator).
-    It uses async_add_external_statistics to insert historical readings into Home Assistant's
-    statistics database, making it compatible with the Energy Dashboard.
-    
-    For consumption-type meters (readingType="consumption"), this sensor also maintains a
-    virtual cumulative meter reading by summing all historical consumption values. This
-    virtual meter is restored across restarts using RestoreEntity.
+    Everything needed to continue the series is read back from the recorder,
+    so restarts and late hours never put a step in the sum.
     """
 
-    def __init__(
-        self, 
-        installation: dict, 
-        api_key: str, 
-        smarthome_base_url: str, 
-        counter: dict,
-        polling_interval: timedelta = timedelta(minutes=30)
-    ) -> None:
+    def __init__(self, coordinator: MaalerportalCoordinator, counter: dict) -> None:
         """Initialize the statistics sensor."""
-        super().__init__(installation, api_key, smarthome_base_url, counter, polling_interval)
-        
+        super().__init__(coordinator, counter)
+
         counter_type = counter.get("counterType", "")
         is_primary = counter.get("isPrimary", False)
         suffix = "primary" if is_primary else "secondary"
-        
-        # Get installation type to distinguish hot vs cold water
-        # (counter_type may always be "ColdWater" for water meters)
-        installation_type = installation.get("installationType", "").lower()
-        
-        # Set attributes based on counter type. The unit the API reports wins when
-        # Home Assistant can handle it, and the imported statistics follow it.
+
+        installation_type = coordinator.installation.get("installationType", "").lower()
+
         if counter_type == "ColdWater" or counter_type == "HotWater":
-            # Use installation type to determine if it's hot or cold water
             if installation_type == "hotwater":
                 self._attr_translation_key = "hot_water_statistic"
                 self._attr_icon = "mdi:water-thermometer"
@@ -1611,395 +1132,137 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
             default_unit, device_class = UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY
         self._apply_counter_unit(default_unit, device_class)
         self._unit_class = statistics_unit_class(self._attr_device_class)
-        
+
         self._attr_unique_id = f"{self._installation_id}_{counter_type.lower()}_statistic_{suffix}"
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
-        
-        # Reading type determines how we process data
-        # "counter" = cumulative meter reading (use value directly)
-        # "consumption" = per-period consumption (need to accumulate)
+
+        # "counter" = cumulative meter reading, "consumption" = per-period consumption
         self._reading_type = counter.get("readingType", "counter").lower()
-        
-        # Statistics metadata - will be set to entity_id after entity is added to HA
-        self._statistic_id: Optional[str] = None  # Will be set in async_added_to_hass
         self._stat_unit = self._attr_native_unit_of_measurement
         self._last_stats_update: Optional[datetime] = None
-        
-        # Track last inserted timestamp and cumulative sum for consumption types
-        self._last_inserted_timestamp: Optional[datetime] = None
-        self._cumulative_sum: float = 0.0
 
     @property
     def native_value(self) -> Optional[float]:
-        """Return None - this sensor is only for importing statistics to Energy Dashboard.
-        
-        The virtual cumulative sum is tracked internally for statistics import,
-        but the sensor itself shows 'unknown' to avoid confusion.
-        """
+        """Always None: this sensor only carries imported statistics."""
         return None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return extra state attributes for persistence."""
-        attrs = {
-            "reading_type": self._reading_type,
-        }
-        if self._statistic_id:
-            attrs["statistic_id"] = self._statistic_id
-        if self._cumulative_sum > 0:
-            attrs["cumulative_sum"] = self._cumulative_sum
-        if self._last_inserted_timestamp:
-            attrs["last_inserted_timestamp"] = self._last_inserted_timestamp.isoformat()
+        """Return extra state attributes."""
+        attrs: dict[str, Any] = {"reading_type": self._reading_type}
+        if self.entity_id:
+            attrs["statistic_id"] = self.entity_id
+        if self._last_stats_update:
+            attrs["last_statistics_update"] = self._last_stats_update.isoformat()
         return attrs
 
-    async def async_added_to_hass(self) -> None:
-        """Run when entity is added to hass - restore state and fetch data."""
-        await super().async_added_to_hass()
-        
-        # Set statistic_id to the sensor's entity_id (e.g., "sensor.xxx")
-        # This allows async_import_statistics to insert data into this sensor's statistics
-        self._statistic_id = self.entity_id
-        _LOGGER.debug("Set statistic_id to entity_id: %s", self._statistic_id)
-        
-        # Restore previous state for consumption-type meters
+    @property
+    def _units(self) -> dict[str, str] | None:
+        """Read statistics back in the unit they are stored in."""
+        if self._unit_class and self._stat_unit:
+            return {self._unit_class: self._stat_unit}
+        return None
+
+    async def _async_last_row(self, statistic_id: str) -> tuple[float, float] | None:
+        last = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, False, {"state", "sum"}
+        )
+        rows = last.get(statistic_id) if last else None
+        if not rows:
+            return None
+        return rows[0].get("state"), rows[0].get("sum")
+
+    async def _async_last_row_start(self, statistic_id: str) -> datetime | None:
+        last = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, False, {"sum"}
+        )
+        rows = last.get(statistic_id) if last else None
+        if not rows:
+            return None
+        return dt_util.utc_from_timestamp(rows[0]["start"])
+
+    async def _async_stored_rows(
+        self, statistic_id: str, start: datetime
+    ) -> dict[datetime, tuple[float, float]]:
+        result = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            start,
+            None,
+            {statistic_id},
+            "hour",
+            self._units,
+            {"state", "sum"},
+        )
+        return {
+            dt_util.utc_from_timestamp(row["start"]): (row.get("state"), row.get("sum"))
+            for row in result.get(statistic_id, [])
+        }
+
+    async def _async_process_history(self, force: bool) -> bool:
+        statistic_id = self.entity_id
+        counter_id = self._counter.get("meterCounterId")
+        if not statistic_id or not counter_id:
+            return True
+
+        last_row = await self._async_last_row(statistic_id)
+        if last_row is None:
+            days = MAX_HISTORY_DAYS
+            _LOGGER.info("No statistics yet for %s, importing the last %d days", statistic_id, days)
+        else:
+            newest = await self._async_last_row_start(statistic_id)
+            behind = (dt_util.utcnow() - newest).days + 2 if newest else MAX_HISTORY_DAYS
+            days = max(RECENT_HISTORY_DAYS, min(behind, MAX_HISTORY_DAYS))
+
+        readings = await self.coordinator.async_get_history(days, force=force)
+        if readings is None:
+            return False
+
+        # Same window the coordinator asked the API for, widened by the hour a
+        # counter reading is moved back.
+        now = dt_util.utcnow()
+        window_start = (now - timedelta(days=days)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) - timedelta(hours=2)
+        stored = await self._async_stored_rows(statistic_id, window_start)
+
         if self._reading_type == "consumption":
-            last_state = await self.async_get_last_state()
-            if last_state is not None:
-                # Restore cumulative sum from state
-                if last_state.state not in (None, "unknown", "unavailable"):
-                    try:
-                        self._cumulative_sum = float(last_state.state)
-                        _LOGGER.debug(
-                            "Restored cumulative sum for %s: %s",
-                            self._attr_unique_id,
-                            self._cumulative_sum
-                        )
-                    except (ValueError, TypeError):
-                        pass
-                
-                # Restore last inserted timestamp from attributes
-                if last_state.attributes:
-                    timestamp_str = last_state.attributes.get("last_inserted_timestamp")
-                    if timestamp_str:
-                        try:
-                            self._last_inserted_timestamp = datetime.fromisoformat(timestamp_str)
-                            _LOGGER.debug(
-                                "Restored last_inserted_timestamp for %s: %s",
-                                self._attr_unique_id,
-                                self._last_inserted_timestamp
-                            )
-                        except (ValueError, TypeError):
-                            pass
-        
-        # Schedule initial statistics update
-        self.hass.async_create_task(self._async_update_statistics())
+            api_hours = consumption_by_hour(readings, counter_id)
+            if not api_hours:
+                _LOGGER.debug("No readings for counter %s", counter_id)
+                return True
+            rows, _ = consumption_rows(api_hours, stored, total_before(stored, last_row))
+        else:
+            by_hour = counter_readings_by_hour(readings, counter_id)
+            if not by_hour:
+                _LOGGER.debug("No readings for counter %s", counter_id)
+                return True
+            rows = counter_rows(by_hour, counter_offset(last_row, by_hour), stored)
 
-    async def _async_fetch(self) -> None:
-        """Update statistics from historical API data."""
-        # If installation is unavailable, only do periodic availability checks
-        if not self._installation_available:
-            await self._check_installation_availability()
-            return
-        
-        await self._async_update_statistics()
+        self._last_stats_update = now
+        if not rows:
+            _LOGGER.debug("Statistics for %s are up to date", statistic_id)
+            return True
 
-    async def _async_update_statistics(self) -> None:
-        """Fetch historical data and insert into Home Assistant statistics."""
-        try:
-            # Ensure we have a statistic_id (entity_id) set
-            if not self._statistic_id:
-                _LOGGER.debug("Skipping statistics update: entity_id not yet available")
-                return
-            
-            counter_id = self._counter.get("meterCounterId")
-            if not counter_id:
-                _LOGGER.warning("No meterCounterId available for statistics sensor")
-                return
-            
-            _LOGGER.debug("Updating statistics for counter: %s (statistic_id: %s)", 
-                          counter_id, self._statistic_id)
-            
-            end_date = datetime.now(timezone.utc)
-            
-            # Check if we have existing statistics
-            last_stats = await get_instance(self.hass).async_add_executor_job(
-                get_last_statistics,
-                self.hass,
-                1,
-                self._statistic_id,
-                True,
-                {"sum"},
-            )
-            
-            has_existing_stats = bool(last_stats and self._statistic_id in last_stats)
-            
-            if has_existing_stats:
-                # We have existing stats, only fetch recent data (last 7 days)
-                start_date = end_date - timedelta(days=7)
-                _LOGGER.debug("Existing statistics found, fetching last 7 days")
-            else:
-                # No existing stats, fetch last 30 days (API max is 31 days)
-                start_date = end_date - timedelta(days=30)
-                # Reset timestamp filter to allow all data
-                self._last_inserted_timestamp = None
-                _LOGGER.info("No existing statistics, fetching last 30 days of history")
-            
-            start_date_iso = start_date.strftime("%Y-%m-%dT00:00:00Z")
-            end_date_iso = end_date.strftime("%Y-%m-%dT23:59:59Z")
-            
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)) as session:
-                response = await session.post(
-                    f"{self._smarthome_base_url}/installations/{self._installation_id}/readings/historical",
-                    json={"from": start_date_iso, "to": end_date_iso},
-                    headers={"ApiKey": self._api_key, "Content-Type": "application/json"},
-                )
-                
-                if response.status == 401:
-                    raise ConfigEntryAuthFailed("API key invalid or expired")
-
-                if response.status == 429:
-                    _LOGGER.warning("Rate limit exceeded for statistics data, will retry later")
-                    return
-
-                # Handle 404/403 - installation no longer accessible
-                if response.status in (404, 403):
-                    _LOGGER.warning(
-                        "Installation %s no longer accessible (HTTP %s)",
-                        self._installation_id,
-                        response.status
-                    )
-                    await self._handle_installation_unavailable()
-                    return
-
-                if not response.ok:
-                    _LOGGER.error("Statistics data request failed: HTTP %s", response.status)
-                    return
-                
-                historical_data = await response.json()
-                readings = historical_data.get("readings", [])
-                
-                _LOGGER.debug("Historical API returned %d readings for installation %s", 
-                              len(readings), self._installation_id)
-                
-                # Debug: Log sample reading to understand structure
-                if readings and self._reading_type == "consumption":
-                    sample = readings[0]
-                    matching_samples = [r for r in readings[:5] if r.get("meterCounterId") == counter_id]
-                    _LOGGER.debug("Sample reading keys: %s", list(sample.keys()))
-                    _LOGGER.debug("Looking for meterCounterId=%s, found %d matches in first 5", 
-                                  counter_id, len(matching_samples))
-                    if matching_samples:
-                        _LOGGER.debug("Matching sample: %s", matching_samples[0])
-                
-                # Filter readings for this counter
-                # For both types: use value field (API always puts the reading in value)
-                # - Counter type: value = cumulative meter reading
-                # - Consumption type: value = interval consumption (need to accumulate)
-                counter_readings = [
-                    r for r in readings 
-                    if r.get("meterCounterId") == counter_id and r.get("value") is not None
-                ]
-                
-                _LOGGER.debug("Filtered to %d readings for counter %s (reading_type=%s)", 
-                              len(counter_readings), counter_id, self._reading_type)
-                
-                if not counter_readings:
-                    _LOGGER.debug("No readings found for counter %s (reading_type=%s)", counter_id, self._reading_type)
-                    return
-                
-                # Sort by timestamp
-                counter_readings.sort(key=lambda x: x.get("timestamp", ""))
-                
-                # For counter-type meters without existing statistics:
-                # Use the first reading as a baseline and subtract it from all values
-                # This prevents the Energy Dashboard from showing massive consumption (0 to current meter value)
-                # Instead, consumption starts from 0 and only shows the delta from the first reading
-                counter_baseline = None
-                if self._reading_type != "consumption" and not has_existing_stats:
-                    # Get the first reading value as baseline
-                    if counter_readings:
-                        first_value = counter_readings[0].get("value")
-                        if first_value is not None:
-                            if isinstance(first_value, str):
-                                counter_baseline = float(re.sub(r'[^\d.-]', '', first_value.strip()))
-                            else:
-                                counter_baseline = float(first_value)
-                            _LOGGER.debug(
-                                "Using first counter reading as baseline: %s (will subtract from all values)",
-                                counter_baseline
-                            )
-                
-                # For consumption type, get existing sum from statistics to continue accumulating
-                if self._reading_type == "consumption" and self._cumulative_sum == 0.0:
-                    try:
-                        existing_stats = await get_instance(self.hass).async_add_executor_job(
-                            get_last_statistics,
-                            self.hass,
-                            1,
-                            self._statistic_id,
-                            True,
-                            {"sum"},
-                        )
-                        if existing_stats and self._statistic_id in existing_stats:
-                            last_stat = existing_stats[self._statistic_id][0]
-                            self._cumulative_sum = last_stat.get("sum", 0.0) or 0.0
-                            _LOGGER.debug("Loaded existing cumulative sum: %s", self._cumulative_sum)
-                    except Exception as err:
-                        _LOGGER.debug("Could not load existing statistics: %s", err)
-                
-                # Build statistics data
-                statistics: list[StatisticData] = []
-                cumulative_sum = self._cumulative_sum
-                
-                for reading in counter_readings:
-                    try:
-                        timestamp_str = reading.get("timestamp")
-                        if not timestamp_str:
-                            continue
-                        
-                        # Parse timestamp - handle both Z suffix and explicit timezone offsets
-                        if timestamp_str.endswith("Z"):
-                            timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                        else:
-                            timestamp = datetime.fromisoformat(timestamp_str)
-                        
-                        # Convert to UTC for Home Assistant statistics
-                        timestamp = timestamp.astimezone(timezone.utc)
-                        
-                        # Round to the start of the hour (in UTC)
-                        timestamp = timestamp.replace(minute=0, second=0, microsecond=0)
-                        
-                        # For counter-type meters, the API timestamp represents WHEN the reading was taken
-                        # (end of measurement period). We need to attribute it to the PREVIOUS hour.
-                        # Example: reading at 00:05 represents the meter state at end of 23:00-00:00 hour
-                        #          so it should be stored with start=23:00, not 00:00
-                        # For consumption-type, the timestamp is already correct from the API.
-                        if self._reading_type != "consumption":
-                            timestamp = timestamp - timedelta(hours=1)
-                        
-                        # Skip if we already have this timestamp
-                        if self._last_inserted_timestamp and timestamp <= self._last_inserted_timestamp:
-                            continue
-                        
-                        if self._reading_type == "consumption":
-                            # For consumption type: accumulate interval values to create virtual meter
-                            # Note: API puts interval consumption in "value" field, not "consumption"
-                            interval_value = reading.get("value")
-                            if interval_value is None:
-                                continue
-                            
-                            # Parse interval value
-                            if isinstance(interval_value, str):
-                                interval_value = float(re.sub(r'[^\d.-]', '', interval_value.strip()))
-                            else:
-                                interval_value = float(interval_value)
-                            
-                            # Only add positive consumption
-                            if interval_value > 0:
-                                cumulative_sum += interval_value
-                            
-                            statistics.append(
-                                StatisticData(
-                                    start=timestamp,
-                                    state=interval_value,  # Current period consumption
-                                    sum=cumulative_sum,    # Virtual meter reading (accumulated)
-                                )
-                            )
-                        else:
-                            # For counter type: value is already cumulative
-                            value = reading.get("value")
-                            if value is None:
-                                continue
-                            
-                            # Parse value
-                            if isinstance(value, str):
-                                value = float(re.sub(r'[^\d.-]', '', value.strip()))
-                            else:
-                                value = float(value)
-                            
-                            # Calculate sum: if we have a baseline, subtract it to get relative consumption
-                            # This ensures the Energy Dashboard starts from 0, not from the meter's total value
-                            if counter_baseline is not None:
-                                relative_sum = value - counter_baseline
-                            else:
-                                relative_sum = value
-                            
-                            statistics.append(
-                                StatisticData(
-                                    start=timestamp,
-                                    state=value,  # Original meter reading
-                                    sum=relative_sum,  # Relative to baseline (starts near 0)
-                                )
-                            )
-                        
-                    except (ValueError, TypeError) as err:
-                        _LOGGER.debug("Error parsing reading: %s - %s", reading, err)
-                        continue
-                
-                # Update cumulative sum for next time
-                if self._reading_type == "consumption":
-                    self._cumulative_sum = cumulative_sum
-                
-                if not statistics:
-                    _LOGGER.debug("No new statistics to insert for counter %s", counter_id)
-                    return
-                
-                # Import statistics into the sensor's history using its entity_id
-                # This allows the Energy Dashboard to see the historical data
-                if not self._statistic_id:
-                    _LOGGER.warning("Cannot insert statistics: entity_id not set yet")
-                    return
-                
-                # Create metadata - use "recorder" as source for sensor statistics
-                metadata = StatisticMetaData(
-                    has_sum=True,
-                    mean_type=StatisticMeanType.NONE,
-                    name=self.name or f"{self._base_device_name}",
-                    source="recorder",
-                    statistic_id=self._statistic_id,
-                    unit_of_measurement=self._stat_unit,
-                    unit_class=self._unit_class,
-                )
-                
-                # Insert statistics using async_import_statistics
-                # This imports into the sensor's existing statistics
-                async_import_statistics(self.hass, metadata, statistics)
-                
-                # Update last inserted timestamp
-                if statistics:
-                    self._last_inserted_timestamp = statistics[-1]["start"]
-                
-                self._last_stats_update = datetime.now(timezone.utc)
-                _LOGGER.info(
-                    "Inserted %d statistics records for %s (from %s to %s)",
-                    len(statistics),
-                    self._statistic_id,
-                    statistics[0]["start"].isoformat() if statistics else "N/A",
-                    statistics[-1]["start"].isoformat() if statistics else "N/A",
-                )
-                
-                # Update entity state for consumption-type meters to reflect new cumulative sum
-                if self._reading_type == "consumption":
-                    self.async_write_ha_state()
-                
-        except ConfigEntryAuthFailed:
-            self._async_start_reauth()
-            raise
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timeout fetching statistics data for sensor")
-        except aiohttp.ClientError as err:
-            _LOGGER.error("Connection error fetching statistics data: %s", err)
-        except Exception as err:
-            _LOGGER.exception("Unexpected error updating statistics: %s", err)
-
-    async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
-        """Not used for statistics sensor - we use async_update_statistics instead."""
-        pass
-
-
-def to_snake_case(s: str) -> str:
-    """Convert a string to snake_case."""
-    s = re.sub("[^a-zA-Z0-9]", " ", s)
-    s = re.sub("(.)([A-Z][a-z]+)", r"\1 \2", s)
-    s = re.sub("([a-z0-9])([A-Z])", r"\1 \2", s)
-    return s.lower().replace(" ", "_")
+        metadata = StatisticMetaData(
+            has_sum=True,
+            mean_type=StatisticMeanType.NONE,
+            name=self.name if isinstance(self.name, str) else self._base_device_name,
+            source="recorder",
+            statistic_id=statistic_id,
+            unit_of_measurement=self._stat_unit,
+            unit_class=self._unit_class,
+        )
+        statistics = [
+            StatisticData(start=start, state=state, sum=total)
+            for start, (state, total) in sorted(rows.items())
+        ]
+        async_import_statistics(self.hass, metadata, statistics)
+        _LOGGER.info(
+            "Imported %d statistics rows for %s (%s to %s)",
+            len(statistics),
+            statistic_id,
+            statistics[0]["start"].isoformat(),
+            statistics[-1]["start"].isoformat(),
+        )
+        return True
